@@ -1,48 +1,67 @@
-# ── Python ───────────────────────────────────────────────────────────────────
+# Python cache
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-*.pyc
-*.egg
-*.egg-info/
-dist/
-build/
-wheels/
-pip-wheel-metadata/
-.eggs/
+*$py.class
 
-# ── Virtual environments ──────────────────────────────────────────────────────
-.venv/
-venv/
-env/
-ENV/
+# Virtual environment (YOUR FOLDER NAME)
+virtual-environment/
 
-# ── App runtime data (generated at runtime, never commit) ─────────────────────
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Database files
+*.sqlite3
+*.db
+
+# Uploads / generated files
 uploads/
 frames/
 results/
 metadata/
 
-# ── Environment & secrets ─────────────────────────────────────────────────────
-.env
-.env.*
-!.env.example
+# Media files
+*.mp4
+*.avi
+*.mov
+*.jpg
+*.jpeg
+*.png
+*.wav
+*.mp3
 
-# ── IDE & editor ─────────────────────────────────────────────────────────────
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / Editor
 .vscode/
 .idea/
 *.swp
 *.swo
-.DS_Store
-Thumbs.db
 
-# ── Testing & coverage ────────────────────────────────────────────────────────
-.pytest_cache/
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing / coverage
 .coverage
 htmlcov/
-.tox/
+.pytest_cache/
 
-# ── Logs ─────────────────────────────────────────────────────────────────────
-*.log
-logs/
+# Type checking
+.mypy_cache/
+
+# Temp files
+*.tmp
+*.temp
+
+# Uvicorn
+*.pid

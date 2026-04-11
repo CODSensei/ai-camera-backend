@@ -1,431 +1,365 @@
+"""
+main.py — Pro Passport Photo API
+Indian Passport spec: 2x2 inch (51x51mm) = 600x600 px @ 300 DPI
+"""
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
-import aiofiles
-import os
-import uuid
-import ffmpeg
+import aiofiles, os, uuid, json
+import subprocess
 import cv2
 import numpy as np
-from pathlib import Path
-import json
-import math
 
-app = FastAPI(title="AI Camera Passport Photo API")
+from helpers import get_biometric_compliance, compute_sharpness
+from crop_helper import perform_biometric_crop
+from bg_helper import remove_background, correct_colour_cast
 
-# ── Directory setup ──────────────────────────────────────────────────────────
-UPLOAD_DIR = "uploads"
-FRAMES_DIR = "frames"
-RESULTS_DIR = "results"
-METADATA_DIR = "metadata"
+app = FastAPI(title="Pro Passport API — Indian Spec")
 
-for d in [UPLOAD_DIR, FRAMES_DIR, RESULTS_DIR, METADATA_DIR]:
+# ---------------------------------------------------------------------------
+# Directories
+# ---------------------------------------------------------------------------
+DIRS = ["uploads", "frames", "results", "metadata"]
+for d in DIRS:
     os.makedirs(d, exist_ok=True)
 
-MAX_FILE_SIZE = 200 * 1024 * 1024  # 200 MB
+# ---------------------------------------------------------------------------
+# Spec constants
+# ---------------------------------------------------------------------------
+CANVAS_PX   = 600          # 2 inch × 2 inch @ 300 DPI
+JPEG_QUALITY = 95          # High quality but keeps file < 500 KB
+MAX_FILE_KB  = 500
 
-# ── Passport photo spec (35mm × 45mm at 300 DPI) ─────────────────────────────
-PASSPORT_W_PX = 413  # 35mm @ 300dpi
-PASSPORT_H_PX = 531  # 45mm @ 300dpi
-PASSPORT_DPI = 300
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENDPOINT 1 — Upload video & extract frames
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# 1. Upload video
+# ===========================================================================
 @app.post("/upload-video/")
-async def upload_and_extract(file: UploadFile = File(...)):
+async def upload_video(file: UploadFile = File(...)):
     """
-    Accepts a 1080p 30fps video (5–10 s).
-    Saves it, extracts every frame via ffmpeg, returns a session_id.
+    Accept a video file. Extract frames at an adaptive rate designed to
+    maximise sharpness variety while staying under 300 frames.
     """
-    if not file.content_type or not file.content_type.startswith("video/"):
-        raise HTTPException(status_code=400, detail="File must be a video.")
+    sid  = str(uuid.uuid4())
+    path = f"uploads/{sid}.mp4"
+    fdir = f"frames/{sid}"
+    os.makedirs(fdir, exist_ok=True)
 
-    # Use a uuid-based name to avoid collisions
-    session_id = str(uuid.uuid4())
-    ext = Path(file.filename).suffix or ".mp4"
-    video_path = os.path.join(UPLOAD_DIR, f"{session_id}{ext}")
-    frame_dir = os.path.join(FRAMES_DIR, session_id)
-    os.makedirs(frame_dir, exist_ok=True)
+    async with aiofiles.open(path, "wb") as f:
+        await f.write(await file.read())
 
-    # ── Save upload ──────────────────────────────────────────────────────────
-    total_bytes = 0
-    async with aiofiles.open(video_path, "wb") as out_file:
-        while chunk := await file.read(1024 * 1024):
-            total_bytes += len(chunk)
-            if total_bytes > MAX_FILE_SIZE:
-                raise HTTPException(
-                    status_code=413, detail="Video exceeds 200 MB limit."
-                )
-            await out_file.write(chunk)
-
-    # ── Extract ALL frames (30 fps) ──────────────────────────────────────────
-    frame_pattern = os.path.join(frame_dir, "frame_%04d.jpg")
+    # --- Probe video duration and native fps ---
+    probe_cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate,nb_frames,duration",
+        "-of", "json", path
+    ]
     try:
-        (
-            ffmpeg.input(video_path)
-            .output(
-                frame_pattern,
-                vf="fps=30",  # keep every frame
-                vframes=300,  # cap at 300 frames (10 s × 30 fps)
-                **{"q:v": "2"},  # high JPEG quality (colon args need dict syntax)
-            )
-            .run(overwrite_output=True, quiet=True)
-        )
-    except ffmpeg.Error as e:
-        raise HTTPException(
-            status_code=500, detail=f"FFmpeg error: {e.stderr.decode()}"
-        )
+        probe_out = subprocess.check_output(probe_cmd, stderr=subprocess.DEVNULL)
+        probe_data = json.loads(probe_out)
+        stream = probe_data.get("streams", [{}])[0]
+        duration = float(stream.get("duration", 10))
+        fps_str  = stream.get("r_frame_rate", "30/1").split("/")
+        native_fps = int(fps_str[0]) / max(1, int(fps_str[1]))
+    except Exception:
+        duration, native_fps = 10.0, 30.0
 
-    frame_files = sorted(
-        f
-        for f in os.listdir(frame_dir)
-        if f.startswith("frame_") and f.endswith(".jpg")
-    )
+    # Extract at 4 fps (enough for compliance variety, avoids duplicates)
+    # Cap at 200 frames total
+    extract_fps = min(4.0, 200.0 / max(duration, 1.0))
 
-    if not frame_files:
-        raise HTTPException(
-            status_code=500, detail="No frames were extracted from the video."
-        )
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-i", path,
+        "-vf", f"fps={extract_fps:.2f}",
+        "-vframes", "200",
+        "-q:v", "1",           # highest JPEG quality from FFmpeg
+        f"{fdir}/frame_%04d.jpg",
+    ]
+    subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # ── Persist session metadata ─────────────────────────────────────────────
-    meta = {
-        "session_id": session_id,
-        "video_path": video_path,
-        "frame_dir": frame_dir,
-        "frame_files": frame_files,
-        "total_frames": len(frame_files),
-    }
-    _save_meta(session_id, meta)
-
-    return {
-        "session_id": session_id,
-        "total_frames": len(frame_files),
-        "preview": frame_files[:5],
-        "message": "Frames extracted. Call /select-best-frames/{session_id} next.",
-    }
+    frames = sorted([f for f in os.listdir(fdir) if f.endswith(".jpg")])
+    _save_meta(sid, {
+        "session_id": sid,
+        "frame_dir":  fdir,
+        "frame_files": frames,
+        "video_duration_s": duration,
+        "extract_fps": extract_fps,
+    })
+    return {"session_id": sid, "total_frames": len(frames), "extract_fps": round(extract_fps, 2)}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENDPOINT 2 — Score & select the best frames
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.post("/select-best-frames/{session_id}")
-async def select_best_frames(session_id: str, top_n: int = 5):
+def _compute_ear_baseline(frame_files: list, frame_dir: str) -> float:
     """
-    Scores every extracted frame on:
-      • Sharpness  (Laplacian variance)
-      • Brightness (mean luminance in 40–220 range)
-      • Face score (face detected + frontal + size)
-      • Eye-open score (eye-aspect-ratio via landmarks)
-
-    Returns the top_n frame filenames ranked by composite score.
+    Sample up to 30 frames to find this person's natural open-eye EAR.
+    Uses 65% of their median as the threshold so narrow eyes never false-flag.
     """
-    meta = _load_meta(session_id)
-    frame_dir = meta["frame_dir"]
-    frame_files = meta["frame_files"]
+    from helpers import _calculate_ear   # import the internal helper
+    ears = []
+    sample = frame_files[::max(1, len(frame_files) // 30)][:30]
 
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-    eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
-
-    scored = []
-    for fname in frame_files:
-        path = os.path.join(frame_dir, fname)
-        frame = cv2.imread(path)
-        if frame is None:
+    for fname in sample:
+        img = cv2.imread(f"{frame_dir}/{fname}")
+        if img is None:
             continue
+        _, _, lm = get_biometric_compliance(img)   # uses default threshold
+        if lm is None:
+            continue
+        l = _calculate_ear(lm, [362, 385, 387, 263, 373, 380])
+        r = _calculate_ear(lm, [33,  160, 158, 133, 153, 144])
+        if l > 0.08 and r > 0.08:   # skip blink frames
+            ears.append((l + r) / 2.0)
 
-        score_data = _score_frame(frame, face_cascade, eye_cascade)
-        scored.append({"filename": fname, **score_data})
+    if len(ears) < 3:
+        return 0.18   # not enough data — use safe fallback
+
+    baseline  = float(np.median(ears))
+    threshold = baseline * 0.65          # 65% of their natural open eye
+    return max(0.10, threshold)          # hard floor — physically can't be open below this
+
+
+# ===========================================================================
+# 2. Select best frames
+# ===========================================================================
+@app.post("/select-best-frames/{session_id}")
+async def select_best(session_id: str, top_n: int = 5):
+    """
+    Score each frame on sharpness + compliance, deduplicate temporally,
+    and return the top N candidates.
+    """
+    meta   = _load_meta(session_id)
+    ear_threshold = _compute_ear_baseline(meta["frame_files"], meta["frame_dir"])
+    meta["ear_threshold"] = ear_threshold
+    _save_meta(session_id, meta)
+    scored = []
+    for fname in meta["frame_files"]:
+        img = cv2.imread(f"{meta['frame_dir']}/{fname}")
+        if img is None:
+            continue
+        
+        # Multi-metric sharpness on face-centre ROI
+        sharpness = compute_sharpness(img)
+
+        # Biometric compliance (more nuanced than binary)
+        eligible, report, _ = get_biometric_compliance(img)
+
+        # Face score: use a graded scale instead of binary 0.1/1.0
+        face_score = _grade_compliance(report)
+
+        scored.append({
+            "filename":   fname,
+            "sharpness":  sharpness,
+            "face_score": face_score,
+            "compliance": report,
+        })
 
     if not scored:
-        raise HTTPException(status_code=404, detail="Could not read any frames.")
+        raise HTTPException(404, "No readable frames found")
 
-    # ── Normalise each sub-score to [0,1] then weight ────────────────────────
-    def _norm(lst, key):
-        vals = [s[key] for s in lst]
-        lo, hi = min(vals), max(vals)
-        span = hi - lo or 1
-        for s in lst:
-            s[f"{key}_norm"] = (s[key] - lo) / span
+    # --- Normalise sharpness to 0–1 ---
+    s_vals = [x["sharpness"] for x in scored]
+    s_min, s_max = min(s_vals), max(s_vals)
+    s_range = max(s_max - s_min, 1e-5)
 
-    _norm(scored, "sharpness")
-    _norm(scored, "brightness")
-    _norm(scored, "face_score")
+    for x in scored:
+        s_norm    = (x["sharpness"] - s_min) / s_range
+        # 40% sharpness, 60% compliance — spec quality is paramount
+        x["composite"] = (s_norm * 0.40) + (x["face_score"] * 0.60)
 
-    WEIGHTS = {"sharpness": 0.30, "brightness": 0.20, "face_score": 0.50}
-    for s in scored:
-        s["composite"] = (
-            WEIGHTS["sharpness"] * s["sharpness_norm"]
-            + WEIGHTS["brightness"] * s["brightness_norm"]
-            + WEIGHTS["face_score"] * s["face_score_norm"]
-        )
+    # Sort descending by composite
+    scored.sort(key=lambda x: x["composite"], reverse=True)
 
-    ranked = sorted(scored, key=lambda x: x["composite"], reverse=True)
-    best = ranked[:top_n]
+    # --- Temporal deduplication ---
+    # Prevent consecutive near-identical frames from consuming all top_n slots
+    MIN_FRAME_GAP = 8   # at 4fps this is ~2 seconds
+    best = _temporal_dedup(scored, min_gap=MIN_FRAME_GAP, n=top_n)
 
     meta["best_frames"] = [b["filename"] for b in best]
-    meta["scored"] = ranked  # full ranking stored for debug
     _save_meta(session_id, meta)
 
-    return {
-        "session_id": session_id,
-        "top_n": top_n,
-        "best_frames": meta["best_frames"],
-        "scores": [
-            {k: round(v, 4) if isinstance(v, float) else v for k, v in b.items()}
-            for b in best
-        ],
-        "message": "Call /generate-passport-photo/{session_id} next.",
-    }
+    return {"best_frames": best}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENDPOINT 3 — Generate passport photo from best frame
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# 3. Generate passport photo
+# ===========================================================================
 @app.post("/generate-passport-photo/{session_id}")
-async def generate_passport_photo(session_id: str, frame_index: int = 0):
+async def generate_photo(session_id: str, frame_index: int = 0):
     """
-    Takes the Nth best frame (default: the best one),
-    detects & crops the face with passport margins,
-    resizes to 35×45 mm at 300 DPI, applies mild enhancement,
-    and saves the result.
-    Returns a photo_id you can use with /download/{photo_id}.
+    Full pipeline for a single selected frame:
+    1. Biometric compliance check
+    2. Colour-cast correction
+    3. Background removal → pure white
+    4. Roll correction + biometric crop (600×600 @ 300 DPI)
+    5. Final background integrity pass
+    6. Save with spec-compliant JPEG settings
     """
     meta = _load_meta(session_id)
+    if not meta.get("best_frames"):
+        raise HTTPException(400, "Run /select-best-frames first")
 
-    if "best_frames" not in meta or not meta["best_frames"]:
-        raise HTTPException(
-            status_code=400,
-            detail="No best frames found. Run /select-best-frames first.",
-        )
-    if frame_index >= len(meta["best_frames"]):
-        raise HTTPException(status_code=400, detail=f"frame_index out of range.")
+    frame_path = f"{meta['frame_dir']}/{meta['best_frames'][frame_index]}"
+    img = cv2.imread(frame_path)
+    if img is None:
+        raise HTTPException(404, "Frame file not found")
 
-    chosen_file = meta["best_frames"][frame_index]
-    frame_path = os.path.join(meta["frame_dir"], chosen_file)
-    frame = cv2.imread(frame_path)
-    if frame is None:
-        raise HTTPException(status_code=500, detail="Could not load selected frame.")
+    # --- 1. Biometric compliance & landmarks ---
+    ear_threshold = meta.get("ear_threshold", 0.18)   # use session baseline
+    is_eligible, report, landmarks = get_biometric_compliance(img, ear_threshold=ear_threshold)
+    if landmarks is None:
+        raise HTTPException(422, "No face detected in selected frame")
 
-    # ── Face detection ───────────────────────────────────────────────────────
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
-    )
+    # --- 2. Colour-cast correction (before background removal) ---
+    img = correct_colour_cast(img)
 
-    if len(faces) == 0:
-        raise HTTPException(
-            status_code=422,
-            detail="No face detected in the selected frame. Try a different frame_index.",
-        )
+    # --- 3. Background removal ---
+    img_no_bg = remove_background(img)
 
-    # Pick largest face
-    faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-    x, y, w, h = faces[0]
-
-    # ── Passport crop with margin ────────────────────────────────────────────
-    # Standard: head occupies 70–80% of frame height; chin-to-crown centred
-    margin_top = int(h * 0.6)  # generous forehead room
-    margin_sides = int(w * 0.5)
-    margin_bottom = int(h * 0.3)  # chin room
-
-    H, W = frame.shape[:2]
-    x1 = max(0, x - margin_sides)
-    y1 = max(0, y - margin_top)
-    x2 = min(W, x + w + margin_sides)
-    y2 = min(H, y + h + margin_bottom)
-
-    cropped = frame[y1:y2, x1:x2]
-
-    # ── Resize to passport dimensions ────────────────────────────────────────
-    passport = cv2.resize(
-        cropped, (PASSPORT_W_PX, PASSPORT_H_PX), interpolation=cv2.INTER_LANCZOS4
+    # --- 4. Roll correction + biometric crop (returns 600×600) ---
+    final_photo, crop_meta = perform_biometric_crop(
+        img_no_bg, landmarks, canvas_px=CANVAS_PX
     )
 
-    # ── Light enhancement ────────────────────────────────────────────────────
-    passport = _enhance(passport)
+    # --- 5. Final background integrity: clamp near-white pixels to pure white ---
+    final_photo = _enforce_white_background(final_photo)
 
-    # ── Save result ──────────────────────────────────────────────────────────
-    photo_id = str(uuid.uuid4())
-    output_path = os.path.join(RESULTS_DIR, f"{photo_id}.jpg")
-    cv2.imwrite(
-        output_path,
-        passport,
-        [cv2.IMWRITE_JPEG_QUALITY, 97, cv2.IMWRITE_JPEG_RST_INTERVAL, PASSPORT_DPI],
-    )
+    # --- 6. Save ---
+    pid      = str(uuid.uuid4())
+    out_path = f"results/{pid}.jpg"
 
-    meta["photo_id"] = photo_id
-    meta["output_path"] = output_path
-    meta["source_frame"] = chosen_file
-    _save_meta(session_id, meta)
+    encode_params = [
+        cv2.IMWRITE_JPEG_QUALITY,   JPEG_QUALITY,
+        cv2.IMWRITE_JPEG_OPTIMIZE,  1,
+        # No PROGRESSIVE flag — some e-form portals reject progressive JPEGs
+    ]
+    cv2.imwrite(out_path, final_photo, encode_params)
+
+    # Warn if file exceeds 500 KB
+    file_kb = os.path.getsize(out_path) / 1024
+    if file_kb > MAX_FILE_KB:
+        # Re-encode at lower quality to meet portal limit
+        q = int(JPEG_QUALITY * MAX_FILE_KB / file_kb) - 2
+        q = max(80, min(q, 95))
+        cv2.imwrite(out_path, final_photo, [cv2.IMWRITE_JPEG_QUALITY, q, cv2.IMWRITE_JPEG_OPTIMIZE, 1])
+        file_kb = os.path.getsize(out_path) / 1024
 
     return {
-        "session_id": session_id,
-        "photo_id": photo_id,
-        "source_frame": chosen_file,
-        "dimensions": f"{PASSPORT_W_PX}×{PASSPORT_H_PX}px ({PASSPORT_DPI} DPI)",
-        "spec": "35mm × 45mm passport standard",
-        "download_url": f"/download/{photo_id}",
+        "photo_id":          pid,
+        "is_compliant":      is_eligible,
+        "compliance_report": report,
+        "crop_metadata":     crop_meta,
+        "file_size_kb":      round(file_kb, 1),
+        "canvas_px":         CANVAS_PX,
+        "spec":              "Indian Passport 2x2 inch 300DPI",
+        "download_url":      f"/download/{pid}",
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENDPOINT 4 — Download the passport photo
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# 4. Download
+# ===========================================================================
 @app.get("/download/{photo_id}")
-async def download_photo(photo_id: str):
-    """Serves the final passport photo JPEG."""
-    # Basic validation — no path traversal
-    if not _is_safe_id(photo_id):
-        raise HTTPException(status_code=400, detail="Invalid photo_id.")
-
-    path = os.path.join(RESULTS_DIR, f"{photo_id}.jpg")
-    if not os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="Photo not found.")
-
+async def download(photo_id: str):
+    path = f"results/{photo_id}.jpg"
+    if not os.path.exists(path):
+        raise HTTPException(404, "Photo not found")
     return FileResponse(
         path,
         media_type="image/jpeg",
-        filename=f"passport_{photo_id}.jpg",
+        headers={"Content-Disposition": f'attachment; filename="passport_{photo_id}.jpg"'}
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENDPOINT 5 — Full pipeline in one shot (convenience)
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.post("/process-video/")
-async def process_video_full(file: UploadFile = File(...), top_n: int = 5):
+# ===========================================================================
+# Internal helpers
+# ===========================================================================
+def _grade_compliance(report: dict) -> float:
     """
-    Convenience endpoint: upload → extract → score → generate passport photo.
-    Returns the photo_id and download URL in a single call.
+    Convert a compliance report into a 0–1 graded score.
+    All-pass = 1.0. Each failed check deducts a weighted amount.
+    This avoids the binary 0.1/1.0 cliff that swamped the composite score.
     """
-    # Step 1
-    upload_result = await upload_and_extract(file)
-    sid = upload_result["session_id"]
+    if "error" in report:
+        return 0.0
 
-    # Step 2
-    await select_best_frames(sid, top_n=top_n)
-
-    # Step 3
-    photo_result = await generate_passport_photo(sid, frame_index=0)
-
-    return {
-        "session_id": sid,
-        "photo_id": photo_result["photo_id"],
-        "download_url": photo_result["download_url"],
-        "source_frame": photo_result["source_frame"],
-        "dimensions": photo_result["dimensions"],
+    weights = {
+        "head_pose_ok":    0.30,
+        "roll_ok":         0.15,
+        "eyes_open_ok":    0.20,
+        "mouth_closed_ok": 0.10,
+        "face_centred_ok": 0.10,
+        "lighting_ok":     0.10,
+        "colour_cast_ok":  0.05,
     }
+    score = 0.0
+    for key, w in weights.items():
+        if report.get(key, False):
+            score += w
+    return score
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ENDPOINT 6 — Session info / debug
-# ═══════════════════════════════════════════════════════════════════════════════
-@app.get("/session/{session_id}")
-async def get_session(session_id: str):
-    """Returns metadata for a session (useful for debugging)."""
-    meta = _load_meta(session_id)
-    # Don't expose full scored list — just summary
-    meta.pop("scored", None)
-    return meta
+def _temporal_dedup(scored: list, min_gap: int, n: int) -> list:
+    """
+    Walk through scored frames (sorted best-first) and only keep a frame
+    if it is at least `min_gap` frames away from any already-kept frame.
+    Returns up to `n` frames.
+    """
+    kept       = []
+    kept_idxes = []
+
+    for item in scored:
+        try:
+            idx = int(item["filename"].split("_")[1].split(".")[0])
+        except (IndexError, ValueError):
+            idx = -999
+
+        if all(abs(idx - k) >= min_gap for k in kept_idxes):
+            kept.append(item)
+            kept_idxes.append(idx)
+
+        if len(kept) >= n:
+            break
+
+    # If dedup was too aggressive, fill remaining slots without the gap constraint
+    if len(kept) < n:
+        existing = set(x["filename"] for x in kept)
+        for item in scored:
+            if item["filename"] not in existing:
+                kept.append(item)
+                if len(kept) >= n:
+                    break
+
+    return kept
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
+def _enforce_white_background(img: np.ndarray) -> np.ndarray:
+    """
+    Clamp any near-white background pixel (R,G,B all > 240) to
+    pure (255,255,255). Prevents JPEG compression drift on the background.
+    """
+    mask = np.all(img > 240, axis=2)
+    out  = img.copy()
+    out[mask] = [255, 255, 255]
+    return out
 
 
-def _score_frame(
-    frame: np.ndarray,
-    face_cascade: cv2.CascadeClassifier,
-    eye_cascade: cv2.CascadeClassifier,
-) -> dict:
-    """Returns raw (un-normalised) quality scores for one frame."""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    # 1. Sharpness — Laplacian variance (higher = sharper)
-    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-    # 2. Brightness — mean luminance; penalise over/under-exposed
-    mean_lum = float(np.mean(gray))
-    brightness = 1.0 - abs(mean_lum - 128) / 128  # peaks at 128, falls off both ways
-
-    # 3. Face score
-    faces = face_cascade.detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
-    )
-    face_score = 0.0
-    if len(faces) > 0:
-        # Pick largest face
-        faces_sorted = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-        fx, fy, fw, fh = faces_sorted[0]
-
-        # Size relative to frame area
-        frame_area = frame.shape[0] * frame.shape[1]
-        face_area = fw * fh
-        size_score = min(face_area / frame_area * 10, 1.0)  # cap at 1
-
-        # Frontal-ness: face should be near horizontal centre
-        face_cx = fx + fw / 2
-        frame_cx = frame.shape[1] / 2
-        center_score = 1.0 - abs(face_cx - frame_cx) / frame_cx
-
-        # Eye detection within face ROI
-        face_roi = gray[fy : fy + fh, fx : fx + fw]
-        eyes = eye_cascade.detectMultiScale(face_roi, scaleFactor=1.1, minNeighbors=3)
-        eye_score = min(len(eyes) / 2.0, 1.0)  # 2 eyes = perfect
-
-        face_score = 0.35 * size_score + 0.25 * center_score + 0.40 * eye_score
-
-    return {
-        "sharpness": sharpness,
-        "brightness": brightness,
-        "face_score": face_score,
-    }
+class _NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (np.integer, np.floating, np.bool_)):
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 
-def _enhance(img: np.ndarray) -> np.ndarray:
-    """Mild, passport-safe enhancement: slight sharpening + CLAHE on luminance."""
-    # Convert to LAB for luminance-only CLAHE
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-
-    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-
-    enhanced_lab = cv2.merge([l, a, b])
-    enhanced = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
-
-    # Light unsharp mask
-    blur = cv2.GaussianBlur(enhanced, (0, 0), 2)
-    sharp = cv2.addWeighted(enhanced, 1.3, blur, -0.3, 0)
-
-    return sharp
+def _save_meta(sid: str, data: dict):
+    with open(f"metadata/{sid}.json", "w") as f:
+        json.dump(data, f, indent=2, cls=_NpEncoder)
 
 
-def _save_meta(session_id: str, data: dict):
-    path = os.path.join(METADATA_DIR, f"{session_id}.json")
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def _load_meta(session_id: str) -> dict:
-    if not _is_safe_id(session_id):
-        raise HTTPException(status_code=400, detail="Invalid session_id.")
-    path = os.path.join(METADATA_DIR, f"{session_id}.json")
-    if not os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="Session not found.")
+def _load_meta(sid: str) -> dict:
+    path = f"metadata/{sid}.json"
+    if not os.path.exists(path):
+        raise HTTPException(404, f"Session {sid} not found")
     with open(path) as f:
         return json.load(f)
-
-
-def _is_safe_id(id_str: str) -> bool:
-    """Validates UUID format to prevent path traversal."""
-    import re
-
-    return bool(re.fullmatch(r"[0-9a-f\-]{36}", id_str))

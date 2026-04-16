@@ -1,0 +1,16 @@
+services:
+  backend:
+    build: .
+    volumes:
+      - ./uploads:/app/uploads
+      - ./frames:/app/frames
+      - ./results:/app/results
+      - ./metadata:/app/metadata
+      # Pre-downloaded models for rembg can be stored here to avoid re-downloading
+      - rembg_models:/root/.u2net
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+volumes:
+  rembg_models:

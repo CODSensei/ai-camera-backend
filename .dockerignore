@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+virtual-environment/
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+
+# Local data folders (we will use volumes instead)
+uploads/
+frames/
+results/
+metadata/
